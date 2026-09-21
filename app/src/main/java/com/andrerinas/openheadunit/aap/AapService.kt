@@ -36,6 +36,7 @@ import com.andrerinas.openheadunit.app.BtAutoStartRearmPolicy
 import com.andrerinas.openheadunit.app.ForegroundServiceTypePolicy
 import com.andrerinas.openheadunit.app.WifiAutoStartReceiver
 import com.andrerinas.openheadunit.connection.wifi.HotspotExitAction
+import com.andrerinas.openheadunit.connection.wifi.HibernateWakeRearmPolicy
 import com.andrerinas.openheadunit.connection.wifi.UsbSessionQuiescePolicy
 import com.andrerinas.openheadunit.connection.wifi.SettingsScreenPausePolicy
 import com.andrerinas.openheadunit.connection.wifi.WirelessBringUpDeferralPolicy
@@ -725,6 +726,44 @@ class AapService : Service() {
         if (settings.autoStartOnUsb) {
             AppLog.i("WakeDetect: checking USB devices (trigger=$trigger)")
             usbLauncherManager.checkAlreadyConnected(force = true)
+        }
+
+        rearmWirelessAfterHibernateWake(trigger, settings)
+    }
+
+    /**
+     * Repairs the Native AA stack after a deep sleep, where the P2P manager and Channel survive as a
+     * shell the framework no longer answers and every group create comes back BUSY until the process
+     * is restarted. A forced swing-through of the launcher rebuilds both exactly like a fresh boot.
+     *
+     * See [HibernateWakeRearmPolicy] for why a stack that just came up (boot, not sleep), one that is
+     * not Native, or one that is not running at all is left alone.
+     */
+    private fun rearmWirelessAfterHibernateWake(
+        trigger: String,
+        settings: Settings,
+    ) {
+        val manager = wifiLauncherManager
+        val now = SystemClock.elapsedRealtime()
+        val decision = HibernateWakeRearmPolicy.decide(
+            mode = settings.wifiConnectionMode,
+            activeMode = manager.activeMode,
+            activeIsStarted = manager.activeIsStarted,
+            msSinceLastNativeRearm = now - manager.lastNativeRearmAtMs,
+            busy = commManager.isConnected ||
+                commManager.connectionState.value is CommManager.ConnectionState.Connecting,
+        )
+        if (decision != HibernateWakeRearmPolicy.Decision.REARM) return
+
+        AppLog.i(
+            "WakeDetect: hibernate wake ($trigger) — rebuilding the Native AA wireless stack so a " +
+                "stale WiFi Direct channel cannot refuse the next group."
+        )
+        serviceScope.launch {
+            // The settle the wired-session re-arm also allows: a re-arm landing mid interface cycle
+            // would be the second bring-up that NativeBringUpReentryPolicy exists to refuse.
+            delay(WIRELESS_REARM_SETTLE_MS)
+            wifiLauncherManager.setActiveFromSettings(force = true)
         }
     }
 
@@ -3349,6 +3388,9 @@ class AapService : Service() {
         /** Screen-off duration (ms) above which SCREEN_ON is treated as a hibernate wake.
          *  60 seconds filters out normal screen timeouts while catching any hibernate/quick boot. */
         private const val HIBERNATE_WAKE_THRESHOLD_MS = 60_000L
+
+        /** The settle a warm re-arm allows the P2P hardware, matching the wired-session one. */
+        private const val WIRELESS_REARM_SETTLE_MS = 1500L
 
         /** Ask for the session without raising the projection. See [suppressNextProjectionRaise]. */
         const val EXTRA_NO_UI = "no_ui"

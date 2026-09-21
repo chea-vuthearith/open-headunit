@@ -29,7 +29,8 @@ open class WifiLauncherManager(val service: AapService) {
      * stops before it starts - so two forced re-arms inside the window could never see each other
      * there, and the second replaced a group the phone had already been told to join.
      */
-    private var lastNativeRearmAtMs = 0L
+    var lastNativeRearmAtMs = 0L
+        private set
 
     /**
      * Whether the status pill's X is still holding the stack down. Set by [stopForUser], lifted

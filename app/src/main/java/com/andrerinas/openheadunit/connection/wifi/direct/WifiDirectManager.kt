@@ -270,6 +270,18 @@ class WifiDirectManager(private val context: Context) : WifiP2pManager.Connectio
     private var stuckCreateCancels = 0
 
     /**
+     * Whether the Channel has already been thrown away for the wedge episode now in progress.
+     *
+     * A unit whose P2P framework restarted under a sleep left the old Channel non-null but dead:
+     * every create is accepted and never forms, so the cancel ladder spends its whole budget against
+     * a fresh one. Rebuilding the Channel and asking once more is the repair. The budget is spent
+     * until a group actually forms (or [stop]), which keeps a radio that truly will not host a group
+     * from cycling the service forever while still letting a unit that wedged once wedge again a
+     * session later.
+     */
+    private var channelRebuildSpentThisBringUp = false
+
+    /**
      * Bumped by every create, cancel and stop, so a group-info retry loop posted under an earlier
      * create cannot run its FATAL and reset the counter underneath the one now in flight.
      */
@@ -406,14 +418,28 @@ class WifiDirectManager(private val context: Context) : WifiP2pManager.Connectio
             }
             P2pCreateWedgePolicy.Variant.BANDED -> createQuietGroup(0)
             null -> {
-                AppLog.e(
-                    "WifiDirectManager: this unit accepts a group request and never forms the group, " +
-                        "on every kind of request it was offered ($stuckCreateCancels cancelled). " +
-                        "Nothing more is asked for until something asks for a group again."
-                )
-                reportGroupRefusal("accepted but never formed")
-                isGroupCreatingOrCreated = false
-                releaseNativeCreateWindow("every create variant was accepted and never formed")
+                if (!channelRebuildSpentThisBringUp && rebuildP2pChannel()) {
+                    // Every variant was accepted by a Channel the framework no longer answers, which
+                    // is what a P2P process restarted under a deep sleep leaves behind. A fresh
+                    // Channel is the repair, and it gets the whole ladder again.
+                    channelRebuildSpentThisBringUp = true
+                    AppLog.w(
+                        "WifiDirectManager: this unit accepts a group request and never forms the " +
+                            "group, on every kind of request it was offered ($stuckCreateCancels " +
+                            "cancelled). The P2P Channel is stale; rebuilding it and asking once more."
+                    )
+                    lastNativeBringUpAtMs = 0L
+                    startNativeAaQuietHost()
+                } else {
+                    AppLog.e(
+                        "WifiDirectManager: this unit accepts a group request and never forms the group, " +
+                            "on every kind of request it was offered ($stuckCreateCancels cancelled). " +
+                            "Nothing more is asked for until something asks for a group again."
+                    )
+                    reportGroupRefusal("accepted but never formed")
+                    isGroupCreatingOrCreated = false
+                    releaseNativeCreateWindow("every create variant was accepted and never formed")
+                }
             }
         }
     }
@@ -955,6 +981,8 @@ class WifiDirectManager(private val context: Context) : WifiP2pManager.Connectio
             acceptedCreateWithoutGroupSinceMs = 0L
             wedgeCancelSpentForStampMs = 0L
             stuckCreateCancels = 0
+            // The Channel hosted a group, so the next wedged bring-up may rebuild it once more.
+            channelRebuildSpentThisBringUp = false
             val ssid = group.networkName
             val psk = group.passphrase ?: ""
             val isOwner = group.isGroupOwner
@@ -1763,6 +1791,33 @@ class WifiDirectManager(private val context: Context) : WifiP2pManager.Connectio
         startNativeAaQuietHost()
     }
 
+    /**
+     * Throw the P2P manager and Channel away and make fresh ones.
+     *
+     * Both outlive a deep sleep the framework inside them does not, leaving a Channel that is
+     * non-null and takes every request while answering none - the shape this manager can only reach
+     * when re-init runs, which it otherwise does only for a null Channel. Answers whether the
+     * platform still hands out a pair, which is the case nothing below can repair.
+     */
+    @SuppressLint("MissingPermission")
+    private fun rebuildP2pChannel(): Boolean = try {
+        val newManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
+        val newChannel = newManager?.initialize(context, context.mainLooper, null)
+        if (newManager != null && newChannel != null) {
+            manager = newManager
+            channel = newChannel
+            AppLog.i("WifiDirectManager: Re-init successful and fields updated.")
+            registerReceiverIfNeeded()
+            true
+        } else {
+            AppLog.e("WifiDirectManager: Re-init failed. Cannot start Quiet Host.")
+            false
+        }
+    } catch (e: Exception) {
+        AppLog.e("WifiDirectManager: Exception during re-init", e)
+        false
+    }
+
     @SuppressLint("MissingPermission")
     fun startNativeAaQuietHost() {
         // Two bring-ups fight over BUSY and the loser removes the winner's group; see
@@ -1785,28 +1840,13 @@ class WifiDirectManager(private val context: Context) : WifiP2pManager.Connectio
 
         if (mgr == null || ch == null) {
             AppLog.w("WifiDirectManager: manager ($mgr) or channel ($ch) is null. Attempting re-init...")
-            try {
-                val newManager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
-                val newChannel = newManager?.initialize(context, context.mainLooper, null)
-                if (newManager != null && newChannel != null) {
-                    manager = newManager
-                    channel = newChannel
-                    mgr = newManager
-                    ch = newChannel
-                    AppLog.i("WifiDirectManager: Re-init successful and fields updated.")
-                    registerReceiverIfNeeded()
-                } else {
-                    AppLog.e("WifiDirectManager: Re-init failed. Cannot start Quiet Host.")
-                    isGroupCreatingOrCreated = false
-                    releaseNativeCreateWindow("the P2P manager could not be re-initialised")
-                    return
-                }
-            } catch (e: Exception) {
-                AppLog.e("WifiDirectManager: Exception during re-init", e)
+            if (!rebuildP2pChannel()) {
                 isGroupCreatingOrCreated = false
-                releaseNativeCreateWindow("the P2P re-init threw")
+                releaseNativeCreateWindow("the P2P manager could not be re-initialised")
                 return
             }
+            mgr = manager
+            ch = channel
         }
 
         // Ensure WiFi is enabled (Required for P2P). Nothing is claimed above this point on purpose:
@@ -2855,6 +2895,7 @@ class WifiDirectManager(private val context: Context) : WifiP2pManager.Connectio
         acceptedCreateWithoutGroupSinceMs = 0L
         wedgeCancelSpentForStampMs = 0L
         stuckCreateCancels = 0
+        channelRebuildSpentThisBringUp = false
         groupInfoEpoch++
         handler.removeCallbacksAndMessages(null)
         // Both of these guard an operation that is finished the moment we stop, and both used to be
