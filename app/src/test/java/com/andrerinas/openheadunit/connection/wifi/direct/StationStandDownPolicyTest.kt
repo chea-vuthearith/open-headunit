@@ -18,10 +18,13 @@ class StationStandDownPolicyTest {
     }
 
     @Test
-    fun `from Q to Android 14 the overlay permission is what gets past the guard`() {
+    fun `from Q to Android 14 the stand down is always attempted regardless of overlay`() {
+        // OEM car head units frequently ignore the SYSTEM_ALERT_WINDOW guard, so the call is
+        // attempted unconditionally. SecurityException is caught; the supplicant readback handles
+        // the case where the ROM does enforce it.
         for (sdk in 29..34) {
-            assertFalse("api $sdk", StationStandDownPolicy.isAvailable(sdk, canDrawOverlays = false))
-            assertTrue("api $sdk", StationStandDownPolicy.isAvailable(sdk, canDrawOverlays = true))
+            assertTrue("api $sdk without overlay", StationStandDownPolicy.isAvailable(sdk, canDrawOverlays = false))
+            assertTrue("api $sdk with overlay", StationStandDownPolicy.isAvailable(sdk, canDrawOverlays = true))
         }
     }
 
@@ -207,10 +210,9 @@ class StationStandDownPolicyTest {
     }
 
     @Test
-    fun `names the overlay permission where that is the missing piece`() {
-        val why = StationStandDownPolicy.describeUnavailable(30, canDrawOverlays = false)
-        assertNotNull(why)
-        assertTrue(why!!.contains("display over other apps"))
+    fun `on Android 10 to 14 nothing blocks it so no explanation is given`() {
+        assertNull(StationStandDownPolicy.describeUnavailable(30, canDrawOverlays = false))
+        assertNull(StationStandDownPolicy.describeUnavailable(34, canDrawOverlays = false))
     }
 
     @Test

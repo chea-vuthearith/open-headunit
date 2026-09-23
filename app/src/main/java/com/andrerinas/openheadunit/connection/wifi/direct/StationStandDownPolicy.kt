@@ -23,10 +23,17 @@ object StationStandDownPolicy {
      * framework and arrived in Android 10 — so this app's target SDK does not decide it, the head
      * unit's version does. That guard also passes anything holding SYSTEM_ALERT_WINDOW, which this
      * app already asks for, and that bypass was removed again in Android 15.
+     *
+     * On Android 10–14 the call is always attempted regardless of whether the overlay permission is
+     * confirmed granted. OEM car head units frequently implement the guard more permissively than the
+     * AOSP reference, and on those devices the call succeeds even without the permission ever showing
+     * up in the Settings UI. The call site catches SecurityException and reads the supplicant state
+     * back after a fixed delay, so an unhonoured attempt is detected and logged rather than silently
+     * misfiring.
      */
     fun isAvailable(sdkInt: Int, canDrawOverlays: Boolean): Boolean = when {
         sdkInt < FIRST_API_WITH_TARGET_SDK_GUARD -> true
-        sdkInt <= LAST_API_WITH_OVERLAY_BYPASS -> canDrawOverlays
+        sdkInt <= LAST_API_WITH_OVERLAY_BYPASS -> true
         else -> false
     }
 
@@ -102,9 +109,6 @@ object StationStandDownPolicy {
      */
     fun describeUnavailable(sdkInt: Int, canDrawOverlays: Boolean): String? = when {
         isAvailable(sdkInt, canDrawOverlays) -> null
-        sdkInt <= LAST_API_WITH_OVERLAY_BYPASS ->
-            "This unit's Android will only let the app drop its own WiFi connection while the app " +
-                "has the \"display over other apps\" permission. Granting it frees the group's radio."
         else ->
             "Android $sdkInt does not let an app drop this unit's own WiFi connection, so the " +
                 "group has to share its channel. Disconnecting this unit's WiFi by hand before " +
